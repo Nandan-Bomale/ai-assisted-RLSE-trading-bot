@@ -1,0 +1,426 @@
+==============================================================================
+AI-ASSISTED RLSE TRADING BOT - PROJECT PLAN & BUILD SPECIFICATION
+==============================================================================
+Repo name (suggested): ai-assisted-rlse-trading-bot
+Audience: an AI coding assistant that will build this project step by step.
+Owner: Cloud (developer, existing RLSE bot on MetaTrader 5).
+Budget: zero. Everything must use free / open-source tools and free data.
+Dev machine: laptop with RTX 3050 (4 GB VRAM). Must run fully on this machine.
+
+------------------------------------------------------------------------------
+0. HOW TO USE THIS DOCUMENT (INSTRUCTIONS TO THE BUILDING AI)
+------------------------------------------------------------------------------
+1. FIRST read the existing RLSE bot code in the repo/folder provided by the
+   owner (main.py, server.py, strategy.py, mt5_engine.py, dashboard.html,
+   config.py, start.bat, settings.json, accounts.json). Summarize how it works
+   and confirm it matches Section 2 before writing any new code. Report any
+   differences between this document and the real code.
+2. Work in the phases of Section 9, in order. Do NOT skip ahead. Each phase has
+   an acceptance gate. Stop at each gate and show the owner the results.
+3. Never modify live trading behavior until the backtester reproduces the
+   existing bot's behavior (Phase 1 gate).
+4. Never invent data or results. If a metric cannot be computed, say so.
+5. Keep the existing bot working at all times. New features are added behind
+   config flags that default to OFF (existing behavior).
+6. Demo accounts only until the owner explicitly says otherwise.
+7. Prefer simple, testable, deterministic code. Do not use an LLM inside the
+   live trading loop.
+8. Write unit tests for all logic that touches money, labels, or features.
+
+------------------------------------------------------------------------------
+1. PROJECT GOAL
+------------------------------------------------------------------------------
+Upgrade the existing rule-based RLSE (Recursive Liquidity Sweep Engine) MT5 bot
+into an AI-assisted bot that improves RISK MANAGEMENT and TRADE MANAGEMENT
+while still taking every RLSE setup. The AI must NOT be used to skip setups
+(main constraint: never miss the rare big winner). It is used to:
+
+  a) Detect breakout vs sweep context and scale position size accordingly.
+  b) Predict how far a move can run, to set dynamic targets and a runner share.
+  c) Manage open trades bar by bar (hold vs exit remaining lots early).
+  d) Enforce hard account-level risk limits.
+  e) Log and label every trade so models can be retrained on a schedule.
+
+Strategy economics (owner's words, paraphrased): the strategy often fails 2-3
+times in a row with small stops (about 4-12 pips on Gold, small on BTC), then
+one long trade (50-100 pips, sometimes about 1:10 R) covers all losses and
+produces profit. The goal is to capture those long trades while cutting the
+losses from (i) breakout days where price keeps trending through the level and
+(ii) trades that reach near a target and reverse to stop.
+
+Honest expectation: AI cannot create an edge that base RLSE does not have. The
+project must first PROVE base RLSE has positive expectancy on multi-year data
+(Phase 1 gate) before models are trained.
+
+------------------------------------------------------------------------------
+2. EXISTING BOT (BASELINE) - AS DESCRIBED BY OWNER
+------------------------------------------------------------------------------
+Platform: MetaTrader 5. Python 3 backend, Flask dashboard on localhost:5000.
+Threads: execution engine (main.py, tick loop) + web server (server.py).
+
+Strategy (1-minute timeframe):
+  Phase 1 - Hunt: track Previous Day High (PDH) and Previous Day Low (PDL).
+    Price crossing above PDH -> SHORT scenario; lock onto the peak of the cross.
+    Price crossing below PDL -> LONG scenario; lock onto the valley of the cross.
+  Phase 2 - Pattern: a reversal window (e.g., 4 bars) opens after the extreme.
+    Pattern 1 (2-candle): for a short, two consecutive red candles where the
+      second closes below the low of the first.
+    Pattern 2 (3-candle engulfing): for a short, Red-Green-Red where the third
+      red engulfs and closes below the lows of the previous two (rejects chop).
+    Longs are the mirror image.
+  Phase 3 - Recursive target lines: if no pattern forms in the window, the
+    extreme is marked as a Target Line; scanning halts until price crosses that
+    line, then the new extreme becomes active and the window resets.
+  Phase 4 - Execution: market order on valid pattern.
+    SL = extreme + user buffer (e.g., 1.5 points Gold, 50 points BTC).
+    Multiple simultaneous positions with TP1/TP2/TP3 at user R:R multipliers
+    (e.g., 1:1, 1:2, 1:3; options 1:1 to 1:10 or "Runner").
+  Daily candle close reference: New York close (4:59 PM EST / 2:29 AM IST).
+
+Components: main.py (loop, orders), server.py (Flask API, JSON config),
+strategy.py (SweepStrategy class), mt5_engine.py (MT5 wrapper), dashboard.html
+(vanilla JS dashboard), config.py (baseline credentials/config), start.bat.
+Persistent files: accounts.json, settings.json.
+
+Known limitations to fix:
+  L1. Entry, SL, TP1/2/3 are static (1:1, 1:2, 1:3).
+  L2. Misses big moves (example: a move of roughly 1:10 while TP3 was 1:3).
+  L3. Some trades approach TP3, reverse, and hit SL although early partials
+      were taken; no logic to exit remaining lots early.
+  L4. No breakout awareness. On breakout days (owner estimates breakouts are
+      about 1-3 of every 10 cases; most are sweeps) the bot keeps fading the
+      move and collects repeated SLs. Huge one-directional candles are one cue.
+  L5. No systematic backtesting or learning from past trades.
+  L6. Trailing SL to cost was considered but rejected by the owner because
+      trades often retest entry and then run; any trailing policy must be
+      evaluated in backtest, not by intuition.
+
+------------------------------------------------------------------------------
+3. SCOPE: WHAT TO BUILD (AND WHAT NOT TO)
+------------------------------------------------------------------------------
+BUILD (3 models + rules + code):
+  M1. Setup Model  - meta-label style model: outputs P(sweep/level fails to
+      hold) and a quality score used to scale lot size (never to skip).
+  M2. Excursion Model - quantile model predicting maximum favorable excursion
+      (in R) after entry; sets dynamic TP levels and runner share.
+  M3. Trade Manager - per-bar hold/exit decision for open trades. Start as
+      RULES; add a model only if it beats the rules in backtest.
+  R1. Risk Guard - deterministic hard limits with veto power (not ML).
+  R2. Orchestrator ("Manager") - deterministic code combining outputs.
+  P1. Learning pipeline ("Learner") - logging, labeling, scheduled retraining,
+      promotion gate, weekly mistake report. It is a pipeline, not a live agent.
+  P2. Backtester + setup logger + walk-forward validation framework.
+  P3. Dashboard extensions.
+
+DO NOT BUILD (at least initially):
+  - A real-time LLM "market analyst" agent in the trading loop (latency,
+    non-determinism, no proven edge).
+  - Reinforcement learning, large deep networks, LLM fine-tuning.
+  - Skipping/filtering of RLSE setups by ML.
+  - Live-money trading features.
+  A news filter, if added, is rule-based (economic calendar windows), and is a
+  feature/flag, not an agent.
+
+------------------------------------------------------------------------------
+4. TARGET ARCHITECTURE
+------------------------------------------------------------------------------
+Data flow for one trade:
+
+  Market data (MT5) -> RLSE Signal Engine (existing strategy.py, unchanged)
+     -> Feature builder -> M1 Setup Model + M2 Excursion Model
+     -> Sizing logic -> Risk Guard (veto/limits) -> Orchestrator -> MT5 orders
+     -> Trade Manager watches each new bar -> exit decisions
+     -> Trade logger -> Learner (labels, retraining, reports)
+
+Design rules:
+  - Signal engine remains the primary model deciding side and timing.
+  - Every agent/model has a clear function signature: features in, numbers out
+    (probabilities/quantiles). Orchestrator authority order:
+      1) Risk Guard veto  2) sizing  3) Trade Manager  4) analyst advice.
+  - Fail-safe: if any model fails to load/predict, fall back to baseline static
+    behavior (existing bot logic) with default lot; never crash the tick loop.
+  - Model inference must be fast (target well under 100 ms per decision on CPU).
+  - Feature computation must use ONLY information available at decision time.
+
+------------------------------------------------------------------------------
+5. SUGGESTED REPOSITORY STRUCTURE
+------------------------------------------------------------------------------
+ai-assisted-rlse-trading-bot/
+  README.md
+  requirements.txt
+  config/
+    settings.default.json        (all new flags default OFF)
+    risk_limits.default.json
+  legacy/                        (copy of the existing bot, kept runnable)
+  src/
+    data/        loaders for MT5, Dukascopy, Binance; cleaning; gap checks
+    strategy/    RLSE engine extracted as a pure, testable module
+    backtest/    event-driven backtester, broker sim (spread, slippage, fills)
+    features/    feature builders (setup-time and per-bar-in-trade)
+    labels/      MFE/MAE, triple-barrier, breakout/sweep labels
+    models/      training, calibration, save/load (setup, excursion, manager)
+    risk/        risk guard, sizing rules
+    orchestrator/  combine outputs, produce order plans
+    live/        MT5 live runner, model loader, fallbacks
+    learner/     trade logging, retraining, promotion gate, reports
+    dashboard/   Flask routes + frontend extensions
+  tests/
+  notebooks/ (optional research)
+  data/ (gitignored)  models/ (gitignored or versioned artifacts)
+  reports/
+
+Never commit credentials (accounts.json, passwords). Add to .gitignore.
+
+------------------------------------------------------------------------------
+6. DATA PLAN (ALL FREE)
+------------------------------------------------------------------------------
+Sources:
+  a) MT5 history from the owner's broker (copy_rates_range / copy_ticks).
+     Most important: it matches live execution, candle boundaries and spreads.
+     Depth of 1-minute history depends on broker and terminal settings; report
+     how many bars are actually available.
+  b) Dukascopy free tick/bar data (Gold XAUUSD and forex). Python library
+     dukascopy_python can fetch to pandas. Community reports say XAUUSD goes
+     back to about 2005 but that some minutes are missing; run gap checks.
+  c) Binance public data (data.binance.vision) for BTC: monthly/daily kline
+     zips, 1m intervals, plus tools like binance-datatool. NOTE: spot
+     timestamps from January 2025 onward are in microseconds; normalize units.
+     Binance BTCUSDT differs from broker BTCUSD; use for extra training volume,
+     validate on broker data.
+Requirements:
+  - Store as parquet, UTC timestamps, with a documented timezone/DST handling
+    for "New York daily close". PDH/PDL must be computed from the finalized
+    prior trading day using the same NY-close rule as the live bot.
+  - Data quality report per instrument: date range, missing minutes, duplicate
+    bars, outlier bars, spread stats when available.
+  - Instruments: start with XAUUSD and BTC (as the owner trades). Add others
+    later. Pool instruments only with volatility-normalized (ATR) features.
+  - Expect thousands (not millions) of labeled setups; design models for that.
+
+------------------------------------------------------------------------------
+7. LABELING & FEATURES
+------------------------------------------------------------------------------
+Setup log (one row per RLSE signal that fires, including those that lose):
+  identifiers: instrument, timestamp, side, level type (PDH/PDL), attempt
+  number within the day/level, entry, SL, buffer used.
+Outcome labels (computed from FUTURE data, used as targets ONLY, never as
+features):
+  - MFE_R and MAE_R: max favorable / adverse excursion in units of R (initial
+    risk), within a defined horizon (e.g., until end of day or N bars).
+  - time_to_SL, time_to_1R/2R/3R, whether each was reached first vs SL.
+  - Triple-barrier / meta-label outcomes (profit / stop / time barrier).
+  - Regime label: "sweep" (price closes back inside the level and stays for X
+    bars/ATR) vs "breakout" (price holds beyond the level). Define precisely,
+    document it, and make thresholds configurable.
+  - Best-possible-exit analysis for the learner (was exit too early/late?).
+Setup-time feature ideas (all computed from data available at entry):
+  - Candle body / ATR, range / ATR, consecutive same-direction candles,
+    largest candle in last N bars relative to ATR.
+  - Distance beyond level in ATR, time since cross, closes beyond level,
+    retest behavior.
+  - Number of prior failed reversals in the same direction today/this level
+    (own-failure counter), previous attempts' MAE.
+  - Session (Asia/London/NY), hour of day, day of week, tick volume/relative
+    volume, spread, volatility regime (ATR percentile), compression before
+    the move.
+  - Distance to next liquidity pools: weekly high/low, session highs/lows,
+    round numbers, previous-day levels not yet taken.
+  - Rule-based news-window flag (optional).
+Per-bar-in-trade features (for Trade Manager): R multiple now, bars since
+  entry, MFE/MAE so far, momentum vs entry direction, candle body/ATR of last
+  bars, distance to next target and to structure, volatility change.
+Leakage rules: label functions look at the future by design. Splits MUST be
+purged and embargoed so no training sample's label window overlaps validation.
+
+------------------------------------------------------------------------------
+8. MODELS, RISK LOGIC, LEARNER
+------------------------------------------------------------------------------
+Model choices (start simple, CPU-friendly, all free):
+  - LightGBM / XGBoost gradient boosting, scikit-learn, Optuna for tuning.
+  - Quantile objectives for M2 (e.g., q50, q75, q90 of MFE_R).
+  - Probability calibration (isotonic/Platt) and calibration plots.
+  - Small GRU/1D-CNN only later, if boosted models plateau (fits in 4 GB VRAM).
+
+M1 Setup Model:
+  - Target: setup fails-to-hold/reverses (sweep) vs breakout, and/or
+    meta-label "profitable under baseline TP plan".
+  - Use: lot multiplier between a minimum lot (never zero) and normal lot.
+  - Baseline to beat: simple rule (e.g., N consecutive failed reversals or an
+    oversized one-way candle => minimum lot).
+
+M2 Excursion Model:
+  - Predict MFE_R quantiles. Use to place TPs dynamically and set the runner
+    fraction of position. Provide a config to cap TP distance.
+
+M3 Trade Manager:
+  - Version 1 rules: time stop, structure break against trade, momentum
+    collapse near target, etc. Backtest each rule.
+  - Version 2 model: P(reach next target before SL | state). Exit remaining
+    lots when probability falls below a tuned threshold.
+  - Compare policies including "trail to cost after TP2" and "no management";
+    report how many top-decile winners each policy destroys.
+
+Risk Guard (deterministic, highest authority):
+  - Daily loss cap, max consecutive SLs (per day/level), max open exposure,
+    max lot, minimum lot floor, kill switch, cooldown rules, stale-data check,
+    spread filter (reduce size or delay, do NOT permanently skip RLSE setups
+    unless the owner enables it), and news-window rule (optional flag).
+  - All limits in risk_limits.json. Owner must supply drawdown tolerance for
+    demo (fixed amount or % of balance) - OPEN QUESTION, use a safe default.
+
+Orchestrator:
+  - Takes signal + model outputs, applies sizing, TP plan, Risk Guard veto,
+    then produces an order plan. Every decision is logged with reasons and
+    model versions.
+
+Learner (pipeline):
+  - After each closed trade: store entry context, management decisions, exit,
+    and labeled outcome; tag mistake categories (e.g., "called sweep, was
+    breakout", "runner exited early", "oversized in compressed range").
+  - Retrain on a schedule (e.g., weekly or every N hundred setups), NOT after
+    every trade.
+  - Promotion gate: a new model goes live only if it beats the current model
+    on walk-forward validation; otherwise keep the old one. Version and store
+    all models with metadata (data range, params, metrics).
+  - Weekly report (markdown): performance, mistake categories, calibration,
+    drift indicators. An LLM may summarize this report OFFLINE, never in the
+    live loop.
+
+------------------------------------------------------------------------------
+9. PHASES, TASKS, ACCEPTANCE GATES
+------------------------------------------------------------------------------
+PHASE 0 - Setup and understanding
+  Tasks: read existing code; write an architecture summary; create repo
+  structure; move existing bot to legacy/ (still runnable); add .gitignore for
+  secrets; requirements.txt; config flags default OFF.
+  Gate: owner confirms the summary matches the bot's real behavior.
+
+PHASE 1 - Data, extracted strategy, backtester, setup logger
+  Tasks: data loaders + quality reports (Section 6); extract RLSE logic into a
+  pure module that can run on historical bars/ticks; event-driven backtester
+  with spread, slippage, and fill assumptions; setup logger with all outcome
+  labels (Section 7); reproduce the existing bot's static 1:1/1:2/1:3 results.
+  Gate A: backtester reproduces the live bot's logic on sample days (spot
+  checks against known live/demo trades).
+  Gate B: report base RLSE expectancy, win rate, R distribution, max drawdown,
+  losing-streak distribution, per instrument and per year. If expectancy is not
+  positive, STOP and report to the owner before building models.
+
+PHASE 2 - Risk Guard + rule-based baselines
+  Tasks: implement Risk Guard; implement rule-based breakout awareness and
+  rule-based sizing; run policy comparisons in backtest (including trailing to
+  cost and fixed alternatives); report the fraction of big winners captured.
+  Gate: rules reduce drawdown/losing-streak damage without destroying big
+  winners, or the owner accepts the measured tradeoff.
+
+PHASE 3 - M1 Setup Model and M2 Excursion Model
+  Tasks: feature pipeline; purged walk-forward training; calibration; compare
+  to Phase 2 baselines; SHAP or feature-importance report; save models.
+  Gate: models beat baselines out-of-sample on expectancy/drawdown AND on
+  "share of top-decile winners still captured". Otherwise keep the rules.
+
+PHASE 4 - Trade Manager
+  Tasks: rule-based version first, then optional model version; backtest
+  against "no management" and "trail to cost".
+  Gate: adopt only what improves net results in walk-forward tests.
+
+PHASE 5 - Live integration (DEMO ONLY)
+  Tasks: model loader with fallbacks; orchestrator; new order plan (dynamic lot,
+  dynamic TPs, runner); per-bar management loop; full decision logging;
+  dashboard extensions; feature flags to switch between legacy and new logic.
+  Gate: demo forward test for a defined period (owner chooses, e.g., several
+  weeks) with logs; compare to backtest expectations; investigate gaps
+  (slippage, fills, data differences).
+
+PHASE 6 - Learner and monitoring
+  Tasks: trade logger; labeling job; scheduled retraining; promotion gate;
+  weekly report; drift monitoring; alerting when performance or calibration
+  degrades; automatic fallback to safe mode.
+  Gate: one full retrain cycle completes and a candidate model is correctly
+  accepted or rejected by the gate.
+
+PHASE 7 - Hardening and optional extras
+  Tasks: broader instrument set; optional small sequence models; rule-based
+  news filter; documentation; cleanup. Live-money consideration ONLY after the
+  owner reviews long demo results, and starting with minimum size.
+
+------------------------------------------------------------------------------
+10. VALIDATION & METRICS
+------------------------------------------------------------------------------
+  - Always use purged/embargoed walk-forward validation; no random splits.
+  - Include spread and slippage in every backtest; report sensitivity to them.
+  - Headline metrics: expectancy per setup (in R), profit factor, max drawdown,
+    longest losing streak, average R of winners, share of top-decile winners
+    captured (KEY metric for this owner), calibration error (Brier/reliability),
+    stability across years and instruments.
+  - Report confidence intervals or bootstrap ranges; overlapping trades are not
+    independent, so do not present raw win rate as a probability of the future.
+  - Compare every model against the simplest baseline; keep the simpler option
+    if the model does not clearly win.
+  - Test for overfitting: parameter sensitivity, out-of-sample years, and a
+    final untouched holdout period evaluated once.
+
+------------------------------------------------------------------------------
+11. DASHBOARD ADDITIONS
+------------------------------------------------------------------------------
+Keep the existing dashboard features (telemetry, positions, account switcher,
+live settings). Add:
+  - Current regime read and model probabilities per active setup.
+  - For each open trade: current R, predicted continuation probability,
+    planned exits, and the reason for each sizing/exit decision.
+  - Risk Guard status (limits used, cooldowns, kill switch state).
+  - Model version info and last retrain result.
+  - Weekly report viewer and mistake-category summary.
+  - Toggle between legacy static mode and AI-assisted mode.
+
+------------------------------------------------------------------------------
+12. TECH STACK (ALL FREE)
+------------------------------------------------------------------------------
+Python 3, pandas, numpy, pyarrow/parquet, MetaTrader5 package, scikit-learn,
+LightGBM, XGBoost, Optuna, SHAP (optional), matplotlib/plotly, Flask
+(existing), pytest. Optional later: PyTorch for small GRU/CNN. Use the local
+CPU; the 4 GB GPU is only needed if small neural nets are added. No paid APIs.
+
+------------------------------------------------------------------------------
+13. RISKS AND HOW TO HANDLE THEM
+------------------------------------------------------------------------------
+  - No edge in base strategy: detected at Phase 1 Gate B; report honestly.
+  - Sparse big winners: use quantile models, report uncertainty, keep the
+    minimum-lot floor so no setup is skipped.
+  - Overfitting: purged walk-forward, simple models, holdout, demo forward test.
+  - Regime change: scheduled retraining, drift monitoring, promotion gate,
+    automatic fallback to baseline.
+  - Data mismatch across sources: validate on broker data; treat external data
+    as extra training volume only.
+  - Look-ahead leakage: unit tests that verify features use only past data.
+  - Live failures (disconnects, stale ticks): Risk Guard stale-data check,
+    safe-mode fallback, no crash in the tick loop.
+  - Security: no credentials in the repo; encrypt or externalize accounts file.
+
+------------------------------------------------------------------------------
+14. OPEN QUESTIONS FOR THE OWNER (BUILDER SHOULD ASK / USE SAFE DEFAULTS)
+------------------------------------------------------------------------------
+  Q1. Maximum acceptable daily loss / drawdown on demo (amount or % of balance)?
+  Q2. Instruments in scope beyond XAUUSD and BTC?
+  Q3. Broker name and how much 1-minute history the MT5 terminal can provide?
+  Q4. Is the existing lot split (for example 0.02 / 0.01 / 0.01) fixed, and what
+      are the minimum and maximum lots allowed?
+  Q5. Exact definition of "breakout" the owner wants (for example: closes beyond
+      the level for N bars, or a specific candle-size multiple of ATR)?
+  Q6. How long should the demo forward test run before any live discussion?
+  Q7. Retraining cadence preference (weekly vs by number of setups)?
+
+------------------------------------------------------------------------------
+15. DEFINITION OF DONE (FIRST MILESTONE)
+------------------------------------------------------------------------------
+Milestone 1 is complete when:
+  - Repo exists with structure in Section 5 and the legacy bot still runs.
+  - Data pipeline and quality reports exist for XAUUSD and BTC.
+  - RLSE logic runs in a backtester that reproduces static-bot behavior.
+  - A multi-year report shows base RLSE expectancy, drawdown, losing streaks,
+    and the distribution of R outcomes, with a clear go / no-go recommendation
+    for building the models.
+
+==============================================================================
+END OF DOCUMENT
+==============================================================================

@@ -1,0 +1,74 @@
+{
+  "_comment": "All AI/ML flags default OFF. Existing bot behavior is preserved until each flag is enabled.",
+  
+  "ai_mode": {
+    "enabled": false,
+    "_comment": "Master switch. false = full legacy behavior. true = AI-assisted mode."
+  },
+
+  "m1_setup_model": {
+    "enabled": false,
+    "model_path": "models/m1_setup_model.pkl",
+    "min_lot_fraction": 0.5,
+    "_comment": "M1: scales lot between min_lot_fraction*base and 1.0*base. Never zeros a trade."
+  },
+
+  "m2_excursion_model": {
+    "enabled": false,
+    "model_path": "models/m2_excursion_model.pkl",
+    "tp_quantile": 0.75,
+    "runner_quantile": 0.90,
+    "max_tp_r": 10.0,
+    "_comment": "M2: sets dynamic TP levels from predicted MFE quantiles."
+  },
+
+  "m3_trade_manager": {
+    "enabled": false,
+    "mode": "rules",
+    "_comment": "rules | model. Start with rules, upgrade to model after backtest.",
+    "rules": {
+      "time_stop_bars": 30,
+      "momentum_collapse_threshold": 0.3,
+      "structure_break_exit": true
+    }
+  },
+
+  "risk_guard": {
+    "enabled": true,
+    "_comment": "Risk Guard is always ON. Deterministic, never an ML model.",
+    "daily_loss_cap_pct": 3.0,
+    "daily_loss_cap_abs": 0,
+    "_comment2": "daily_loss_cap_abs=0 means use pct. Set abs to override with a fixed $ amount.",
+    "max_consecutive_sls_per_level": 3,
+    "max_consecutive_sls_per_day": 5,
+    "max_open_exposure_lots": 0.30,
+    "max_lot_per_trade": 0.10,
+    "min_lot_floor": 0.01,
+    "kill_switch": false,
+    "cooldown_after_daily_cap_bars": 0,
+    "_comment3": "cooldown_after_daily_cap_bars=0 means halt for rest of day.",
+    "stale_tick_timeout_seconds": 30,
+    "max_spread_filter_atr_fraction": 0.5,
+    "_comment4": "If spread > this fraction of ATR, log warning but do NOT skip setup (per plan).",
+    "news_window_enabled": false,
+    "news_window_minutes_before": 15,
+    "news_window_minutes_after": 15
+  },
+
+  "learner": {
+    "enabled": false,
+    "retrain_cadence": "weekly",
+    "min_setups_to_retrain": 100,
+    "promotion_gate_metric": "expectancy_r",
+    "report_output_dir": "reports/"
+  },
+
+  "data": {
+    "timezone": "UTC",
+    "ny_close_hour_utc": 21,
+    "ny_close_minute_utc": 0,
+    "_comment": "NY 4:59 PM EST = 21:59 UTC (non-DST). Adjust for DST as needed.",
+    "parquet_dir": "data/",
+    "instruments": ["XAUUSD", "BTCUSD"]
+  }
+}

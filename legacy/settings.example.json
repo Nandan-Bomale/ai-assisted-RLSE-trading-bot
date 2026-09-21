@@ -1,0 +1,16 @@
+{
+    "GOLD.i#": {
+        "sl_buffer": 1.5,
+        "lot_size": 0.03,
+        "tp1": 1,
+        "tp2": 2,
+        "tp3": 5
+    },
+    "BTCUSD#": {
+        "sl_buffer": 50,
+        "lot_size": 0.03,
+        "tp1": 1,
+        "tp2": 2,
+        "tp3": 5
+    }
+}

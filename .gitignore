@@ -1,9 +1,43 @@
+# ─── Credentials & sensitive configs ─────────────────────
+config.py
+accounts.json
+settings.json
+journal.csv
+*.env
+.env.*
+
+# ─── Data & model artifacts (gitignored, kept locally) ───
+data/
+models/
+*.parquet
+*.pkl
+*.pt
+*.joblib
+*.db
+*.sqlite
+
+# ─── Python cache ─────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
-.env
-config.py
-journal.csv
-settings.json
+*.pyd
+.Python
 
-accounts.json
+# ─── Notebooks checkpoints ────────────────────────────────
+notebooks/.ipynb_checkpoints/
+.ipynb_checkpoints/
+
+# ─── Reports (generated output) ───────────────────────────
+reports/*.html
+reports/*.pdf
+
+# ─── IDE & OS files ───────────────────────────────────────
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# ─── Build & dist ─────────────────────────────────────────
+build/
+dist/
+*.egg-info/
