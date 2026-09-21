@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+config.py
+journal.csv
+settings.json
+
+accounts.json

@@ -1,0 +1,426 @@
+//@version=6
+indicator("Vario Nandan's RLSE Indicator", shorttitle="Vario Nandan's RLSE Indicator", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// =====================================================================
+//  "Vario Nandan's RLSE Indicator v3"
+//
+//  SHORT (mirror image for LONG with PDL / swing low)
+//  -------------------------------------------------------------------
+//  1. Price crosses PDH  -> episode starts (once per day, per side).
+//  2. FIRST ENTRY: a 2-candle or 3-candle reversal right after the peak
+//     -> SELL.  (No target-line cross needed for this first trade.)
+//  3. The swing high becomes the TARGET LINE.
+//     It only ever moves UP, and only when price crosses above it.
+//  4. NEXT ENTRIES: price must cross ABOVE the target line first, and the
+//     2-candle / 3-candle reversal must form AFTER that cross -> SELL.
+//     The new, higher peak then becomes the new target line. Repeat.
+//  5. Episode resets when the new day's PDH/PDL takes over.
+//
+//  SL  = peak + buffer        TP1 / TP2 / TP3 = 1R / 2R / 3R
+// =====================================================================
+
+type Trade
+    int   dir
+    int   startBar
+    float entry
+    float sl
+    float tp1
+    float tp2
+    float tp3
+    bool  tp1Hit = false
+    bool  tp2Hit = false
+    box   tpBox
+    box   slBox
+    line  lnEntry
+    line  lnSL
+    line  lnTP1
+    line  lnTP2
+    line  lnTP3
+    label lbEntry
+    label lbSL
+    label lbTP1
+    label lbTP2
+    label lbTP3
+
+// ------------------------------ INPUTS --------------------------------
+gLevel = "1 | Levels, Target Line & Patterns"
+triggerOnWick = input.bool(true, "Arm when wick crosses PDH/PDL (OFF = candle must close beyond)", group=gLevel)
+usePat1     = input.bool(true, "Pattern 1: 2-candle reversal", group=gLevel)
+usePat2     = input.bool(true, "Pattern 2: 3-candle engulfing trap", group=gLevel)
+windowBars  = input.int(4, "Reversal window (bars after the latest peak/valley)", minval=3, group=gLevel,
+     tooltip="The reversal pattern must complete within this many bars after the latest extreme. If it does not, the extreme becomes the target line and the indicator waits for price to cross it. Minimum 3 so the 3-candle pattern can complete.")
+maxPerDay   = input.int(10, "Max signals per side per day", minval=1, group=gLevel)
+
+gRisk = "2 | Stop Loss & Take Profit"
+bufType  = input.string("ATR", "SL buffer type", options=["ATR", "Percent of price", "Fixed points"], group=gRisk,
+     tooltip="Buffer added beyond the extreme. ATR / Percent adapt to any market. Fixed points = e.g. 1.5 for Gold.")
+atrLen   = input.int(14, "ATR length", minval=1, group=gRisk)
+bufATR   = input.float(1.0, "Buffer: ATR multiple", minval=0.0, step=0.1, group=gRisk)
+bufPct   = input.float(0.03, "Buffer: % of price", minval=0.0, step=0.01, group=gRisk)
+bufFixed = input.float(1.5, "Buffer: fixed points", minval=0.0, step=0.1, group=gRisk)
+r1       = input.float(1.0, "TP1 = R multiple", minval=0.1, step=0.5, group=gRisk)
+r2       = input.float(2.0, "TP2 = R multiple", minval=0.1, step=0.5, group=gRisk)
+r3       = input.float(3.0, "TP3 = R multiple", minval=0.1, step=0.5, group=gRisk)
+
+gTrade = "3 | Trade Handling"
+oneAtATime   = input.bool(false, "Ignore new signals while another trade is still open", group=gTrade,
+     tooltip="OFF (default) = every valid signal is drawn and tracked, so nothing is missed.")
+maxTradeBars = input.int(1000, "Close a trade box after N bars (expiry)", minval=10, group=gTrade)
+
+gVis = "4 | Visuals"
+buyCol      = input.color(#4caf50, "BUY colour",  group=gVis)
+sellCol     = input.color(#f23645, "SELL colour", group=gVis)
+entryCol    = input.color(#ffb300, "Entry line colour", group=gVis)
+tpCol       = input.color(#66bb6a, "TP colour",   group=gVis)
+slCol       = input.color(#f23645, "SL colour",   group=gVis)
+showLevels  = input.bool(true, "Show PDH / PDL lines", group=gVis)
+showTargets = input.bool(true, "Show swing target lines", group=gVis)
+showMarkers  = input.bool(true, "Mark PDH/PDL cross and target-line cross bars", group=gVis)
+showLbl     = input.bool(true, "Show price labels (Entry / SL / TP1-3)", group=gVis)
+showTable   = input.bool(true, "Show info + accuracy table", group=gVis)
+tblPos      = input.string(position.top_right, "Table position", options=[position.top_right, position.top_left, position.bottom_right, position.bottom_left, position.middle_right], group=gVis)
+
+// ---------------------- PREVIOUS DAY HIGH / LOW -----------------------
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+
+newDay = timeframe.change("D")
+plot(showLevels and not newDay ? pdh : na, "PDH", color=color.new(#ff9800, 10), linewidth=1, style=plot.style_linebr)
+plot(showLevels and not newDay ? pdl : na, "PDL", color=color.new(#2962ff, 10), linewidth=1, style=plot.style_linebr)
+
+// ------------------------------ HELPERS -------------------------------
+atr     = ta.atr(atrLen)
+isRed   = close < open
+isGreen = close > open
+
+buf = bufType == "ATR" ? atr * bufATR : bufType == "Percent of price" ? close * bufPct / 100.0 : bufFixed
+
+crossS = triggerOnWick ? high > pdh : close > pdh   // PDH cross -> SHORT episode
+crossL = triggerOnWick ? low  < pdl : close < pdl   // PDL cross -> LONG episode
+
+f_targets(float entry, float sl, int dir) =>
+    float risk = math.abs(entry - sl)
+    [entry + dir * risk * r1, entry + dir * risk * r2, entry + dir * risk * r3]
+
+f_txt(string name, float price, bool hit) =>
+    (hit ? "✔ " : "") + name + "  " + str.tostring(price, format.mintick)
+
+f_pct(int part, int total) =>
+    total > 0 ? str.tostring(part * 100.0 / total, "#.#") + "%" : "-"
+
+// ------------------------------- STATE --------------------------------
+// mode: 0 = FIRST (reversal allowed right after the peak)
+//       1 = WAIT  (target line set, patterns blocked until price crosses it)
+//       2 = CROSSED (target line crossed, watching for the reversal pattern)
+var bool  armedS = false
+var int   modeS = 0
+var float peakHigh = na
+var int   peakBarS = na
+var int   sinceExtS = 0
+var int   startS = na
+var float tgtS = na
+var line  tgtLineS = na
+var int   cntS = 0
+
+var bool  armedL = false
+var int   modeL = 0
+var float peakLow = na
+var int   peakBarL = na
+var int   sinceExtL = 0
+var int   startL = na
+var float tgtL = na
+var line  tgtLineL = na
+var int   cntL = 0
+
+var array<Trade> trades = array.new<Trade>()
+
+// statistics
+var int nLong = 0
+var int nShort = 0
+var int nClosed = 0
+var int reach1 = 0
+var int reach2 = 0
+var int reach3 = 0
+var int cSL = 0
+var int cExp = 0
+
+bool longSig  = false
+bool shortSig = false
+bool isCrossS   = false
+bool isCrossL   = false
+bool xS       = false
+bool xL       = false
+int   sDir = 0
+float sEnt = na
+float sSL  = na
+float sT1  = na
+float sT2  = na
+float sT3  = na
+
+string r1Txt = str.tostring(r1, "#.##") + "R"
+string r2Txt = str.tostring(r2, "#.##") + "R"
+string r3Txt = str.tostring(r3, "#.##") + "R"
+
+// ---------------------------- MAIN LOGIC ------------------------------
+if barstate.isconfirmed
+    if newDay
+        armedS := false
+        armedL := false
+        cntS := 0
+        cntL := 0
+
+    // ---------------- manage every open trade (SL checked first = conservative)
+    int nT = array.size(trades)
+    if nT > 0
+        for i = nT - 1 to 0
+            Trade t = array.get(trades, i)
+            if bar_index > t.startBar
+                bool slHit  = t.dir == 1 ? low <= t.sl : high >= t.sl
+                bool tp1Now = t.dir == 1 ? high >= t.tp1 : low <= t.tp1
+                bool tp2Now = t.dir == 1 ? high >= t.tp2 : low <= t.tp2
+                bool tp3Now = t.dir == 1 ? high >= t.tp3 : low <= t.tp3
+                bool done = false
+                string res = ""
+                if slHit
+                    done := true
+                    res := t.tp2Hit ? "TP2" : t.tp1Hit ? "TP1" : "SL"
+                else
+                    if tp1Now
+                        t.tp1Hit := true
+                    if tp2Now
+                        t.tp1Hit := true
+                        t.tp2Hit := true
+                    if tp3Now
+                        t.tp1Hit := true
+                        t.tp2Hit := true
+                        done := true
+                        res := "TP3"
+                if not done and bar_index - t.startBar >= maxTradeBars
+                    done := true
+                    res := "EXP"
+
+                box.set_right(t.tpBox, bar_index)
+                box.set_right(t.slBox, bar_index)
+                line.set_x2(t.lnEntry, bar_index)
+                line.set_x2(t.lnSL, bar_index)
+                line.set_x2(t.lnTP1, bar_index)
+                line.set_x2(t.lnTP2, bar_index)
+                line.set_x2(t.lnTP3, bar_index)
+                if showLbl
+                    label.set_x(t.lbEntry, bar_index)
+                    label.set_x(t.lbSL, bar_index)
+                    label.set_x(t.lbTP1, bar_index)
+                    label.set_x(t.lbTP2, bar_index)
+                    label.set_x(t.lbTP3, bar_index)
+                    label.set_text(t.lbTP1, f_txt("TP1 " + r1Txt, t.tp1, t.tp1Hit))
+                    label.set_text(t.lbTP2, f_txt("TP2 " + r2Txt, t.tp2, t.tp2Hit))
+                    label.set_text(t.lbTP3, f_txt("TP3 " + r3Txt, t.tp3, done and res == "TP3"))
+                    label.set_text(t.lbSL, (done and res == "SL" ? "✖ " : "") + "SL  " + str.tostring(t.sl, format.mintick))
+
+                if done
+                    array.remove(trades, i)
+                    if res == "EXP"
+                        cExp += 1
+                    else
+                        nClosed += 1
+                        if t.tp1Hit
+                            reach1 += 1
+                        if t.tp2Hit
+                            reach2 += 1
+                        if res == "TP3"
+                            reach3 += 1
+                        if res == "SL"
+                            cSL += 1
+
+    if not na(pdh) and not na(pdl)
+
+        // ===================== SHORT  (PDH crossed) =====================
+        if not armedS and crossS
+            armedS := true
+            modeS := 0
+            peakHigh := high
+            peakBarS := bar_index
+            sinceExtS := 0
+            startS := bar_index
+            tgtS := na
+            tgtLineS := na
+            isCrossS := true
+        else if armedS
+            if high > peakHigh
+                peakHigh := high
+                peakBarS := bar_index
+                sinceExtS := 0
+                if modeS == 1
+                    modeS := 2
+                    startS := bar_index
+                    xS := true
+                    if not na(tgtLineS)
+                        line.set_x2(tgtLineS, bar_index)
+            else
+                sinceExtS += 1
+
+        if armedS and modeS != 1
+            bool p1 = usePat1 and isRed and isRed[1] and close < low[1] and (bar_index - 1 >= startS)
+            bool p2 = usePat2 and isRed and isGreen[1] and isRed[2] and close < low[1] and close < low[2] and (bar_index - 2 >= startS)
+            if p1 or p2
+                float ent = close
+                float slP = peakHigh + buf
+                [a1, a2, a3] = f_targets(ent, slP, -1)
+                float risk = slP - ent
+                if cntS < maxPerDay and not (oneAtATime and array.size(trades) > 0) and risk > syminfo.mintick
+                    shortSig := true
+                    sDir := -1
+                    sEnt := ent
+                    sSL := slP
+                    sT1 := a1
+                    sT2 := a2
+                    sT3 := a3
+                    cntS += 1
+                modeS := 1
+                tgtS := peakHigh
+                if showTargets
+                    tgtLineS := line.new(peakBarS, tgtS, bar_index, tgtS, color=color.new(#ff9800, 0), style=line.style_dashed, width=1)
+            else if sinceExtS > windowBars
+                modeS := 1
+                tgtS := peakHigh
+                if showTargets
+                    tgtLineS := line.new(peakBarS, tgtS, bar_index, tgtS, color=color.new(#ff9800, 0), style=line.style_dashed, width=1)
+
+        if armedS and modeS == 1 and not na(tgtLineS)
+            line.set_x2(tgtLineS, bar_index)
+
+        // ===================== LONG  (PDL crossed) =====================
+        if not armedL and crossL
+            armedL := true
+            modeL := 0
+            peakLow := low
+            peakBarL := bar_index
+            sinceExtL := 0
+            startL := bar_index
+            tgtL := na
+            tgtLineL := na
+            isCrossL := true
+        else if armedL
+            if low < peakLow
+                peakLow := low
+                peakBarL := bar_index
+                sinceExtL := 0
+                if modeL == 1
+                    modeL := 2
+                    startL := bar_index
+                    xL := true
+                    if not na(tgtLineL)
+                        line.set_x2(tgtLineL, bar_index)
+            else
+                sinceExtL += 1
+
+        if armedL and modeL != 1
+            bool q1 = usePat1 and isGreen and isGreen[1] and close > high[1] and (bar_index - 1 >= startL)
+            bool q2 = usePat2 and isGreen and isRed[1] and isGreen[2] and close > high[1] and close > high[2] and (bar_index - 2 >= startL)
+            if q1 or q2
+                float ent = close
+                float slP = peakLow - buf
+                [b1, b2, b3] = f_targets(ent, slP, 1)
+                float risk = ent - slP
+                if cntL < maxPerDay and not (oneAtATime and array.size(trades) > 0) and risk > syminfo.mintick
+                    longSig := true
+                    sDir := 1
+                    sEnt := ent
+                    sSL := slP
+                    sT1 := b1
+                    sT2 := b2
+                    sT3 := b3
+                    cntL += 1
+                modeL := 1
+                tgtL := peakLow
+                if showTargets
+                    tgtLineL := line.new(peakBarL, tgtL, bar_index, tgtL, color=color.new(#5c8dff, 0), style=line.style_dashed, width=1)
+            else if sinceExtL > windowBars
+                modeL := 1
+                tgtL := peakLow
+                if showTargets
+                    tgtLineL := line.new(peakBarL, tgtL, bar_index, tgtL, color=color.new(#5c8dff, 0), style=line.style_dashed, width=1)
+
+        if armedL and modeL == 1 and not na(tgtLineL)
+            line.set_x2(tgtLineL, bar_index)
+
+    // ---------------- Phase 3 : draw the position tool
+    if longSig or shortSig
+        bool isLong = sDir == 1
+        float e  = math.round_to_mintick(sEnt)
+        float sl = math.round_to_mintick(sSL)
+        float t1 = math.round_to_mintick(sT1)
+        float t2 = math.round_to_mintick(sT2)
+        float t3 = math.round_to_mintick(sT3)
+
+        Trade nt = Trade.new(dir=sDir, startBar=bar_index, entry=e, sl=sl, tp1=t1, tp2=t2, tp3=t3)
+        nt.tpBox := box.new(bar_index, isLong ? t3 : e, bar_index, isLong ? e : t3, border_color=color.new(tpCol, 100), bgcolor=color.new(tpCol, 85))
+        nt.slBox := box.new(bar_index, isLong ? e : sl, bar_index, isLong ? sl : e, border_color=color.new(slCol, 100), bgcolor=color.new(slCol, 80))
+        nt.lnEntry := line.new(bar_index, e,  bar_index, e,  color=entryCol, width=2)
+        nt.lnSL    := line.new(bar_index, sl, bar_index, sl, color=slCol,    width=2)
+        nt.lnTP1   := line.new(bar_index, t1, bar_index, t1, color=tpCol,    width=1)
+        nt.lnTP2   := line.new(bar_index, t2, bar_index, t2, color=tpCol,    width=1)
+        nt.lnTP3   := line.new(bar_index, t3, bar_index, t3, color=tpCol,    width=2)
+        if showLbl
+            nt.lbEntry := label.new(bar_index, e,  "Entry  " + str.tostring(e, format.mintick), style=label.style_label_left, color=color.new(entryCol, 15), textcolor=color.black, size=size.small)
+            nt.lbSL    := label.new(bar_index, sl, f_txt("SL", sl, false), style=label.style_label_left, color=color.new(slCol, 15), textcolor=color.white, size=size.small)
+            nt.lbTP1   := label.new(bar_index, t1, f_txt("TP1 " + r1Txt, t1, false), style=label.style_label_left, color=color.new(tpCol, 15), textcolor=color.white, size=size.small)
+            nt.lbTP2   := label.new(bar_index, t2, f_txt("TP2 " + r2Txt, t2, false), style=label.style_label_left, color=color.new(tpCol, 15), textcolor=color.white, size=size.small)
+            nt.lbTP3   := label.new(bar_index, t3, f_txt("TP3 " + r3Txt, t3, false), style=label.style_label_left, color=color.new(tpCol, 15), textcolor=color.white, size=size.small)
+        array.push(trades, nt)
+
+        if isLong
+            nLong += 1
+            label.new(bar_index, low, "BUY", style=label.style_label_up, color=buyCol, textcolor=color.white, size=size.normal)
+        else
+            nShort += 1
+            label.new(bar_index, high, "SELL", style=label.style_label_down, color=sellCol, textcolor=color.white, size=size.normal)
+
+        alert((isLong ? "LONG " : "SHORT ") + syminfo.ticker + " | Entry " + str.tostring(e, format.mintick) + " | SL " + str.tostring(sl, format.mintick) + " | TP1 " + str.tostring(t1, format.mintick) + " | TP2 " + str.tostring(t2, format.mintick) + " | TP3 " + str.tostring(t3, format.mintick), alert.freq_once_per_bar_close)
+
+// ---------------------- MARKERS & ALERTS ------------------------
+plotshape(showMarkers and isCrossS, "PDH crossed",                 shape.triangledown, location.abovebar, color=color.new(#ff9800, 0), size=size.tiny)
+plotshape(showMarkers and isCrossL, "PDL crossed",                 shape.triangleup,   location.belowbar, color=color.new(#2962ff, 0), size=size.tiny)
+plotshape(showMarkers and xS,     "Swing high target crossed", shape.diamond,      location.abovebar, color=color.new(#f23645, 0), size=size.tiny)
+plotshape(showMarkers and xL,     "Swing low target crossed",  shape.diamond,      location.belowbar, color=color.new(#4caf50, 0), size=size.tiny)
+
+alertcondition(longSig,  "RLSE Long signal",  "RLSE LONG signal on {{ticker}} ({{interval}})")
+alertcondition(shortSig, "RLSE Short signal", "RLSE SHORT signal on {{ticker}} ({{interval}})")
+
+// -------------------------- INFO / ACCURACY TABLE ---------------------
+var table info = table.new(tblPos, 2, 12, bgcolor=color.new(#131722, 15), border_width=1, border_color=color.new(color.gray, 60))
+if barstate.islast and showTable
+    string shortTxt = "Waiting for PDH cross"
+    color  shortCol = color.gray
+    if armedS
+        shortCol := sellCol
+        shortTxt := modeS == 0 ? "PDH crossed - watching reversal" : modeS == 1 ? "Target " + str.tostring(tgtS, format.mintick) + " - wait cross" : "Crossed - watching reversal"
+    string longTxt = "Waiting for PDL cross"
+    color  longCol = color.gray
+    if armedL
+        longCol := buyCol
+        longTxt := modeL == 0 ? "PDL crossed - watching reversal" : modeL == 1 ? "Target " + str.tostring(tgtL, format.mintick) + " - wait cross" : "Crossed - watching reversal"
+
+    table.cell(info, 0, 0, "Vario Nandan's RLSE Indicator", text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 0, syminfo.ticker, text_color=color.white, text_halign=text.align_right, text_size=size.small)
+    table.cell(info, 0, 1, "PDH", text_color=color.new(#ff9800, 0), text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 1, str.tostring(pdh, format.mintick), text_color=color.white, text_halign=text.align_right, text_size=size.small)
+    table.cell(info, 0, 2, "PDL", text_color=color.new(#5c8dff, 0), text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 2, str.tostring(pdl, format.mintick), text_color=color.white, text_halign=text.align_right, text_size=size.small)
+    table.cell(info, 0, 3, "Short side", text_color=color.gray, text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 3, shortTxt, text_color=shortCol, text_halign=text.align_right, text_size=size.small)
+    table.cell(info, 0, 4, "Long side", text_color=color.gray, text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 4, longTxt, text_color=longCol, text_halign=text.align_right, text_size=size.small)
+    table.cell(info, 0, 5, "Open trades", text_color=color.gray, text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 5, str.tostring(array.size(trades)), text_color=color.white, text_halign=text.align_right, text_size=size.small)
+    table.cell(info, 0, 6, "Signals  L / S", text_color=color.gray, text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 6, str.tostring(nLong) + " / " + str.tostring(nShort), text_color=color.white, text_halign=text.align_right, text_size=size.small)
+    table.cell(info, 0, 7, "Closed trades", text_color=color.gray, text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 7, str.tostring(nClosed), text_color=color.white, text_halign=text.align_right, text_size=size.small)
+    table.cell(info, 0, 8, "ACCURACY  TP1 (" + r1Txt + ")", text_color=color.new(tpCol, 0), text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 8, f_pct(reach1, nClosed) + "  (" + str.tostring(reach1) + ")", text_color=color.white, text_halign=text.align_right, text_size=size.small)
+    table.cell(info, 0, 9, "ACCURACY  TP2 (" + r2Txt + ")", text_color=color.new(tpCol, 0), text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 9, f_pct(reach2, nClosed) + "  (" + str.tostring(reach2) + ")", text_color=color.white, text_halign=text.align_right, text_size=size.small)
+    table.cell(info, 0, 10, "ACCURACY  TP3 (" + r3Txt + ")", text_color=color.new(tpCol, 0), text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 10, f_pct(reach3, nClosed) + "  (" + str.tostring(reach3) + ")", text_color=color.white, text_halign=text.align_right, text_size=size.small)
+    table.cell(info, 0, 11, "Stopped out before TP1", text_color=color.new(slCol, 0), text_halign=text.align_left, text_size=size.small)
+    table.cell(info, 1, 11, f_pct(cSL, nClosed) + "  (" + str.tostring(cSL) + ")", text_color=color.white, text_halign=text.align_right, text_size=size.small)
